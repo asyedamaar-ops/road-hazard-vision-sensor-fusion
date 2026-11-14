@@ -1,92 +1,121 @@
+"""Step 4: run the detector on the dashcam video and fuse it with the accelerometer.
+
+    python run_dashcam_ai.py --weights runs/detect/train/weights/best.pt
+
+For every frame the script finds the accelerometer reading taken at the same
+moment. A warning is drawn only when the camera sees a crack AND the vertical
+acceleration is below the threshold (see fusion.should_warn).
+
+    --no-display        run without a window (for servers)
+    --save out.mp4      write the annotated video to a file
+"""
+import argparse
+
 import cv2
 import pandas as pd
-from ultralytics import YOLO
-import os
 
-print(" Initiating Final Protocol: Vision + Sensor Fusion...")
+import config
+from fusion import SensorLookup, crop_road, frame_to_timestamp, should_warn
 
-# --- EXACT PATHS FROM YOUR WORKSPACE ---
-model_path = r"E:\Vehicle-Damage-Detection\runs\detect\train4\weights\best.pt"
-video_path = os.path.join("Data", "Raw_Data", "PVS 1", "video_environment_dataset_left.mp4")
-sensor_data_path = os.path.join("Data", "Raw_Data", "PVS 1", "dataset_gps_mpu_left.csv")
+WARNING_TEXT = 'WARNING: POSSIBLE ROAD HAZARD'
 
-try:
-    # --- 1. LOAD AI AND SENSOR DATA ---
-    print(" Loading YOLOv8 Brain...")
-    model = YOLO(model_path)
 
-    print(" Loading Accelerometer Data...")
-    df = pd.read_csv(sensor_data_path)
-    t0 = df['timestamp'].min() # Establish Time Zero
+def yolo_detector(weights, conf):
+    """Wrap a YOLO model as detect(frame) -> (class names found, annotated frame)."""
+    from ultralytics import YOLO
 
-    print(" Opening Dashcam Feed...")
-    cap = cv2.VideoCapture(video_path)
+    model = YOLO(str(weights))
+
+    def detect(frame):
+        result = model(frame, conf=conf, verbose=False)[0]
+        names = [model.names[int(c)] for c in result.boxes.cls]
+        return names, result.plot()
+
+    return detect
+
+
+def run(video_path, sensor, detect, start_minute=config.START_MINUTE,
+        acc_threshold=config.LIVE_ACC_THRESHOLD, hazard_class=config.HAZARD_CLASS,
+        display=True, save_path=None, max_frames=None):
+    """Process the video. Returns the list of frame numbers on which a warning was raised.
+
+    `sensor` is a fusion.SensorLookup and `detect` is a function like the one
+    yolo_detector() returns. Passing them in keeps this loop testable with a
+    fake detector and a tiny synthetic video.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f'Could not open the video: {video_path}')
     fps = cap.get(cv2.CAP_PROP_FPS)
-    start_frame = int(5 * 60 * fps)
+
+    # Jump ahead, and start the counter at the SAME frame. The counter is used to
+    # look up the sensor reading, so it must be the position in the whole video.
+    start_frame = int(start_minute * 60 * fps)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    frame_count = start_frame
-    print("\n System Active. Press 'q' in the video window to safely shut down.")
+    frame_index = start_frame
 
-    # --- 2. MAIN REAL-TIME LOOP ---
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            print(" End of video reached.")
-            break
+    writer = None
+    warnings = []
+    try:
+        while max_frames is None or frame_index - start_frame < max_frames:
+            success, frame = cap.read()
+            if not success:
+                break
 
-        # A. The Crop: Remove the old raw graphs from the right side of the video
-        height, width, _ = frame.shape
-        frame = frame[:, :int(width * 0.50)]
+            frame = crop_road(frame, config.KEEP_LEFT_FRACTION)
+            acc_z = sensor.nearest(frame_to_timestamp(frame_index, sensor.t0, fps))
+            detected, annotated = detect(frame)
 
-        # B. The Sync: Find the exact sensor reading for this specific video frame
-        current_video_time = frame_count / fps
-        current_timestamp = t0 + current_video_time
-        
-        # Grab the single closest row of sensor data
-        sensor_row = df.iloc[(df['timestamp'] - current_timestamp).abs().argsort()[:1]]
-        current_az = sensor_row['acc_z_below_suspension'].values[0]
+            cv2.putText(annotated, f'Z-accel: {acc_z:.2f} m/s^2', (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+            if should_warn(detected, acc_z, acc_threshold, hazard_class):
+                warnings.append(frame_index)
+                cv2.putText(annotated, WARNING_TEXT, (20, 100),
+                            cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 3)
 
-        # C. The Vision: Let the RTX 4060 scan the frame for hazards
-        results = model(frame, conf=0.5, verbose=False)
-        
-        # plot() draws the beautiful bounding boxes automatically
-        annotated_frame = results[0].plot() 
+            if save_path:
+                if writer is None:
+                    height, width = annotated.shape[:2]
+                    writer = cv2.VideoWriter(str(save_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                writer.write(annotated)
+            if display:
+                cv2.imshow('Road Hazard Vision Fusion', annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
-        # D. The Fusion Logic
-        detected_classes = [model.names[int(c)] for c in results[0].boxes.cls]
-        warning_triggered = False
-        
-        if "Concentric_Crack" in detected_classes:
-            # Gravity is ~9.8. If it drops past -5.0, the car is falling into a hole.
-            if current_az < -5.0: 
-                warning_triggered = True
-
-        # --- 3. HEADS UP DISPLAY (HUD) ---
-        # Print the live Z-Axis gravity in the top left corner
-        cv2.putText(annotated_frame, f"Live Z-Accel: {current_az:.2f} m/s^2", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-        # Flash the massive red warning if fusion conditions are met!
-        if warning_triggered:
-            cv2.putText(annotated_frame, "CRITICAL: SINKHOLE IMMINENT", (20, 100),
-                        cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 3)
-
-        # Display the final fused video on your screen
-        cv2.imshow("Sinkhole Vision Fusion AI", annotated_frame)
-
-        # Safety escape key
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-        frame_count += 1
-
-except Exception as e:
-    print(f"\n CRITICAL ERROR: {e}")
-    print("Make sure your hard drive is plugged in and the file paths are correct!")
-
-finally:
-    # Always clean up windows when done
-    if 'cap' in locals() and cap is not None:
+            frame_index += 1
+    finally:
         cap.release()
-    cv2.destroyAllWindows()
-    print(" System Shut Down Successfully.")
+        if writer is not None:
+            writer.release()
+        if display:
+            cv2.destroyAllWindows()
+    return warnings
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--weights', default=config.WEIGHTS_PATH)
+    parser.add_argument('--video', default=config.VIDEO_PATH)
+    parser.add_argument('--sensor-csv', default=config.SENSOR_CSV)
+    parser.add_argument('--start-minute', type=float, default=config.START_MINUTE)
+    parser.add_argument('--acc-threshold', type=float, default=config.LIVE_ACC_THRESHOLD)
+    parser.add_argument('--conf', type=float, default=config.CONFIDENCE)
+    parser.add_argument('--no-display', action='store_true')
+    parser.add_argument('--save', default=None, help='write the annotated video to this file')
+    parser.add_argument('--max-frames', type=int, default=None)
+    args = parser.parse_args()
+
+    df = pd.read_csv(args.sensor_csv)
+    sensor = SensorLookup(df['timestamp'], df[config.ACC_COLUMN])
+    detect = yolo_detector(args.weights, args.conf)
+
+    print("Running. Press 'q' in the video window to stop.")
+    warnings = run(args.video, sensor, detect, start_minute=args.start_minute,
+                   acc_threshold=args.acc_threshold, display=not args.no_display,
+                   save_path=args.save, max_frames=args.max_frames)
+    print(f'Finished. Warnings raised on {len(warnings)} frames.')
+
+
+if __name__ == '__main__':
+    main()

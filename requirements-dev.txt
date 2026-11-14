@@ -1,0 +1,5 @@
+# enough to run the tests: no YOLO model, no GPU, no dataset
+numpy
+pandas
+opencv-python-headless
+pytest
