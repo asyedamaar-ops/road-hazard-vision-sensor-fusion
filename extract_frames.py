@@ -1,80 +1,59 @@
-import pandas as pd
-import cv2
+"""Step 2: save the video frame for each severe-drop event, for labelling.
+
+    python extract_frames.py
+
+Converts each event timestamp to a frame number, reads that frame and keeps
+the road half of the picture.
+"""
+import argparse
 import os
 
-# 1. Using the Environment video to simulate a Dashcam
-video_filename = "video_environment_dataset_left.mp4"
+import cv2
+import pandas as pd
 
-# 2. File Paths
-video_path = os.path.join("Data", "Raw_Data", "PVS 1", video_filename)
-events_path = os.path.join("Data", "Processed_Data", "sinkhole_events_session1.csv")
-full_data_path = os.path.join("Data", "Raw_Data", "PVS 1", "dataset_gps_mpu_left.csv")
+import config
+from fusion import crop_road, timestamp_to_frame
 
-output_folder = os.path.join("Data", "Processed_Data", "Extracted_Frames")
-os.makedirs(output_folder, exist_ok=True)
 
-print(f"Loading data to sync sensor drops with {video_filename}...")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--video', default=config.VIDEO_PATH)
+    parser.add_argument('--events-csv', default=config.EVENTS_CSV)
+    parser.add_argument('--sensor-csv', default=config.SENSOR_CSV)
+    parser.add_argument('--output-dir', default=config.FRAMES_DIR)
+    parser.add_argument('--step', type=int, default=config.EVENT_SAMPLE_STEP,
+                        help='keep every Nth event, to avoid many frames of the same spot')
+    args = parser.parse_args()
 
-try:
-    # 3. Load the data
-    df_events = pd.read_csv(events_path)
-    df_full = pd.read_csv(full_data_path)
-    
-    # Get "Time Zero" (The exact moment the sensors started recording)
-    t0 = df_full['timestamp'].min()
-    print(f"Sensor Start Time (T0): {t0}")
-    
-    # 4. Open the Video File
-    cap = cv2.VideoCapture(video_path)
-    
+    os.makedirs(args.output_dir, exist_ok=True)
+    df_events = pd.read_csv(args.events_csv)
+    # "time zero": the moment the sensors started recording
+    t0 = pd.read_csv(args.sensor_csv, usecols=['timestamp'])['timestamp'].min()
+    print(f'Sensor start time (t0): {t0}')
+
+    cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
-        print(f" ERROR: Could not open {video_filename}. Make sure it is in the PVS 1 folder!")
-        exit()
-        
+        raise SystemExit(f'Could not open the video: {args.video}')
     fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Video loaded! FPS: {fps}, Total Frames: {total_frames}")
-    
-    # 5. Extract the Frames!
-    # We grab every 50th severe drop to avoid extracting identical, consecutive frames of the same hole
-    sample_events = df_events.iloc[::50] 
-    
-    print(f"\nExtracting {len(sample_events)} unique dashcam frames for YOLO training...")
-    
-    count = 0
-    for index, row in sample_events.iterrows():
-        event_time = row['timestamp']
-        
-        # Calculate how many seconds into the video the event happened
-        seconds_in = event_time - t0
-        
-        # Calculate the exact frame number
-        target_frame = int(seconds_in * fps)
-        
-        # Fast-forward the video to that exact frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-        
-        # Read the frame
-        # Read the frame
-        success, frame = cap.read()
-        
-        if success:
-            #  NEW CODE: Crop the frame to keep only the left 55% (the road) 
-            height, width, _ = frame.shape
-            cropped_frame = frame[:, :int(width * 0.50)] 
-            
-            # Save the CROPPED image
-            image_name = f"dashcam_sinkhole_proxy_{target_frame}.jpg"
-            save_path = os.path.join(output_folder, image_name)
-            cv2.imwrite(save_path, cropped_frame) # Make sure this says cropped_frame!
-            count += 1
-            
-    cap.release()
-    print("-" * 40)
-    print(f" SUCCESS! Extracted {count} images to: {output_folder}")
-    print("-" * 40)
+    print(f'Video loaded. FPS: {fps}, frames: {int(cap.get(cv2.CAP_PROP_FRAME_COUNT))}')
 
-except FileNotFoundError:
-    print(" ERROR: Could not find one of the CSV files. Did you move them?")
-except Exception as e:
-    print(f" An error occurred: {e}")
+    sample_events = df_events.iloc[::args.step]
+    print(f'Extracting {len(sample_events)} frames...')
+
+    count = 0
+    for _, row in sample_events.iterrows():
+        target_frame = timestamp_to_frame(row['timestamp'], t0, fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        success, frame = cap.read()
+        if success:
+            image_name = f'dashcam_sinkhole_proxy_{target_frame}.jpg'
+            cv2.imwrite(os.path.join(str(args.output_dir), image_name),
+                        crop_road(frame, config.KEEP_LEFT_FRACTION))
+            count += 1
+
+    cap.release()
+    print(f'Extracted {count} images to: {args.output_dir}')
+
+
+if __name__ == '__main__':
+    main()

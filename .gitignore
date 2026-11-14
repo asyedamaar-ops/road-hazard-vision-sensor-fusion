@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+# data, weights and training output are not part of the repository
+Data/
+runs/
+*.pt
+Sinkhole_Vision_Fusion-1/
